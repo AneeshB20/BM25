@@ -23,6 +23,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "cli.hpp"
+
 #include "bm25/corpus.hpp"
 #include "bm25/inverted_index.hpp"
 #include "bm25/searcher.hpp"
@@ -115,11 +117,11 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--data") == 0 && has_value) {
             data_dir = argv[++i];
         } else if (std::strcmp(argv[i], "-k") == 0 && has_value) {
-            k = std::strtoul(argv[++i], nullptr, 10);
+            k = cli::parse_count("-k", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--k1") == 0 && has_value) {
-            params.k1 = std::strtod(argv[++i], nullptr);
+            params.k1 = cli::parse_real("--k1", argv[++i], 0.0, 1e6);
         } else if (std::strcmp(argv[i], "--b") == 0 && has_value) {
-            params.b = std::strtod(argv[++i], nullptr);
+            params.b = cli::parse_real("--b", argv[++i], 0.0, 1.0);
         } else if (std::strcmp(argv[i], "--no-stem") == 0) {
             opts.stem = false;
         } else if (std::strcmp(argv[i], "--no-stopwords") == 0) {

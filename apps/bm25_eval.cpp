@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 
+#include "cli.hpp"
+
 #include "bm25/corpus.hpp"
 #include "bm25/inverted_index.hpp"
 #include "bm25/metrics.hpp"
@@ -131,10 +133,10 @@ int run_ablations(const bm25::Corpus& corpus, const std::string& md_path,
                       "test queries; nDCG@10 uses linear gain, as trec_eval does.\n\n");
 
     auto run_name = [&](const TokConfig& tc, const bm25::Bm25Params& p) {
-        char buf[128];
-        std::snprintf(buf, sizeof buf, "%s/bm25_stem-%s_stop-%s_k1-%.2f_b-%.2f.trec", runs_dir.c_str(),
-                      on_off(tc.opts.stem), on_off(tc.opts.remove_stopwords), p.k1, p.b);
-        return std::string(buf);
+        char params_buf[64];
+        std::snprintf(params_buf, sizeof params_buf, "_k1-%.2f_b-%.2f.trec", p.k1, p.b);
+        return runs_dir + "/bm25_stem-" + on_off(tc.opts.stem) + "_stop-" +
+               on_off(tc.opts.remove_stopwords) + params_buf;
     };
 
     // Table 1: tokenizer ablations at the main BM25 parameters.
@@ -286,8 +288,12 @@ void usage() {
 
 int main(int argc, char** argv) {
     std::string data_dir = "data/scifact";
-    std::string run_path = "results/bm25_run.trec";
-    std::string metrics_path = "results/bm25_metrics.tsv";
+    // Defaults point at the committed results; they are used only for the main
+    // configuration, so an experiment never silently overwrites them.
+    std::string run_path;
+    std::string metrics_path;
+    bool run_path_given = false;
+    bool metrics_path_given = false;
     std::string ablations_path;
     std::string runs_dir;
     std::string tag = "bm25";
@@ -306,8 +312,10 @@ int main(int argc, char** argv) {
             data_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--out") == 0 && has_value) {
             run_path = argv[++i];
+            run_path_given = true;
         } else if (std::strcmp(argv[i], "--metrics-out") == 0 && has_value) {
             metrics_path = argv[++i];
+            metrics_path_given = true;
         } else if (std::strcmp(argv[i], "--ablations") == 0 && has_value) {
             ablations_path = argv[++i];
         } else if (std::strcmp(argv[i], "--runs-dir") == 0 && has_value) {
@@ -317,18 +325,18 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--tag") == 0 && has_value) {
             tag = argv[++i];
         } else if (std::strcmp(argv[i], "-k") == 0 && has_value) {
-            depth = std::strtoul(argv[++i], nullptr, 10);
+            depth = cli::parse_count("-k", argv[++i], 1);
             depth_given = true;
         } else if (std::strcmp(argv[i], "--bench") == 0) {
             bench = true;
         } else if (std::strcmp(argv[i], "--repeats") == 0 && has_value) {
-            repeats = std::atoi(argv[++i]);
+            repeats = static_cast<int>(cli::parse_count("--repeats", argv[++i], 2));
         } else if (std::strcmp(argv[i], "--warmup-sec") == 0 && has_value) {
-            warmup_sec = std::strtod(argv[++i], nullptr);
+            warmup_sec = cli::parse_real("--warmup-sec", argv[++i], 0.0, 3600.0);
         } else if (std::strcmp(argv[i], "--k1") == 0 && has_value) {
-            params.k1 = std::strtod(argv[++i], nullptr);
+            params.k1 = cli::parse_real("--k1", argv[++i], 0.0, 1e6);
         } else if (std::strcmp(argv[i], "--b") == 0 && has_value) {
-            params.b = std::strtod(argv[++i], nullptr);
+            params.b = cli::parse_real("--b", argv[++i], 0.0, 1.0);
         } else if (std::strcmp(argv[i], "--no-stem") == 0) {
             opts.stem = false;
         } else if (std::strcmp(argv[i], "--no-stopwords") == 0) {
@@ -347,6 +355,17 @@ int main(int argc, char** argv) {
         if (bench) {
             // Benchmark top-10 retrieval unless a depth was asked for.
             return run_bench(corpus, opts, params, depth_given ? depth : 10, repeats, warmup_sec, index_path);
+        }
+
+        const bool main_config = opts.stem && opts.remove_stopwords && params.k1 == 0.9 &&
+                                 params.b == 0.4 && depth == 100 && index_path.empty();
+        if (!run_path_given && main_config) run_path = "results/bm25_run.trec";
+        if (!metrics_path_given && main_config) metrics_path = "results/bm25_metrics.tsv";
+        if (!main_config && !run_path_given) {
+            std::fprintf(stderr, "note: non-default configuration; pass --out to write a run file\n");
+        }
+        if (depth < 100) {
+            std::fprintf(stderr, "warning: -k %zu < 100, so Recall@100 only sees the top %zu\n", depth, depth);
         }
 
         bm25::InvertedIndex index;
