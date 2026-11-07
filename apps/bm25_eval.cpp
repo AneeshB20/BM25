@@ -8,8 +8,16 @@
 //   bm25_eval --ablations MD [--data DIR] [--runs-dir DIR]
 //       Runs the tokenizer ablations and the k1 x b grid and writes a Markdown table.
 //       With --runs-dir, also writes each configuration's run file there.
+//
+//   bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR]
+//       Spins for S seconds (default 15) building and querying, untimed, so a
+//       laptop CPU leaves its low-power clock state; then times the index build
+//       and every judged query N times (default 5), discards the first
+//       repetition, and prints build time and per-query latency percentiles.
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -162,11 +170,80 @@ int run_ablations(const bm25::Corpus& corpus, const std::string& md_path,
     return 0;
 }
 
+// Nearest-rank percentile of an already sorted sample.
+double percentile(const std::vector<double>& sorted, double p) {
+    if (sorted.empty()) return 0.0;
+    const double rank = std::ceil(p / 100.0 * static_cast<double>(sorted.size()));
+    const std::size_t idx = rank < 1.0 ? 0 : static_cast<std::size_t>(rank) - 1;
+    return sorted[std::min(idx, sorted.size() - 1)];
+}
+
+int run_bench(const bm25::Corpus& corpus, const bm25::TokenizerOptions& opts,
+              const bm25::Bm25Params& params, std::size_t depth, int repeats, double warmup_sec) {
+    if (repeats < 2) throw std::runtime_error("--repeats must be at least 2");
+    const bm25::Tokenizer tokenizer(opts);
+    const std::vector<bm25::Query> queries = corpus.judged_queries();
+
+    // Untimed warm-up. Under a power-saving governor the first second or two of
+    // work runs at a fraction of full clock speed, which otherwise swamps the
+    // differences we want to measure.
+    std::size_t warm_checksum = 0;
+    const auto warm_start = Clock::now();
+    while (std::chrono::duration<double>(Clock::now() - warm_start).count() < warmup_sec) {
+        bm25::InvertedIndex warm;
+        warm.build(corpus.documents(), tokenizer);
+        const bm25::Searcher s(warm, tokenizer, params);
+        for (const bm25::Query& q : queries) warm_checksum += s.search(q.text, depth).size();
+    }
+
+    // Index build: repeat, discard the first (cold caches, page faults).
+    std::vector<double> build_ms;
+    bm25::InvertedIndex index;
+    for (int r = 0; r < repeats; ++r) {
+        const auto t0 = Clock::now();
+        index.build(corpus.documents(), tokenizer);
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (r > 0) build_ms.push_back(ms);
+    }
+    std::sort(build_ms.begin(), build_ms.end());
+
+    // Query latency: every judged query, `repeats` passes, first pass discarded.
+    const bm25::Searcher searcher(index, tokenizer, params);
+    std::vector<double> lat_us;
+    std::size_t checksum = 0;  // keeps the optimiser from discarding results
+    for (int r = 0; r < repeats; ++r) {
+        for (const bm25::Query& q : queries) {
+            const auto t0 = Clock::now();
+            const auto hits = searcher.search(q.text, depth);
+            const double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+            checksum += hits.size();
+            if (r > 0) lat_us.push_back(us);
+        }
+    }
+    std::sort(lat_us.begin(), lat_us.end());
+    double total_us = 0.0;
+    for (double v : lat_us) total_us += v;
+
+    std::printf("bench:        %.0f s warm-up, %d repetitions, first discarded; k=%zu; %zu queries per pass\n",
+                warmup_sec, repeats, depth, queries.size());
+    std::printf("index build:  median %.1f ms  (min %.1f, max %.1f) over %zu runs\n",
+                percentile(build_ms, 50), build_ms.front(), build_ms.back(), build_ms.size());
+    std::printf("query p50:    %.1f us\n", percentile(lat_us, 50));
+    std::printf("query p95:    %.1f us\n", percentile(lat_us, 95));
+    std::printf("query p99:    %.1f us\n", percentile(lat_us, 99));
+    std::printf("query mean:   %.1f us over %zu timed queries (QPS %.0f single-threaded)\n",
+                total_us / static_cast<double>(lat_us.size()), lat_us.size(),
+                1e6 * static_cast<double>(lat_us.size()) / total_us);
+    std::printf("checksum:     %zu results (warm-up %zu)\n", checksum, warm_checksum);
+    return 0;
+}
+
 void usage() {
     std::fprintf(stderr,
                  "usage: bm25_eval [--data DIR] [--out RUN] [--metrics-out TSV] [-k N]\n"
                  "                 [--k1 X] [--b X] [--no-stem] [--no-stopwords] [--tag NAME]\n"
-                 "       bm25_eval --ablations MD [--data DIR] [--runs-dir DIR]\n");
+                 "       bm25_eval --ablations MD [--data DIR] [--runs-dir DIR]\n"
+                 "       bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR]\n");
 }
 
 }  // namespace
@@ -179,6 +256,10 @@ int main(int argc, char** argv) {
     std::string runs_dir;
     std::string tag = "bm25";
     std::size_t depth = 100;
+    bool depth_given = false;
+    bool bench = false;
+    int repeats = 5;
+    double warmup_sec = 15.0;
     bm25::TokenizerOptions opts;
     bm25::Bm25Params params;
 
@@ -198,6 +279,13 @@ int main(int argc, char** argv) {
             tag = argv[++i];
         } else if (std::strcmp(argv[i], "-k") == 0 && has_value) {
             depth = std::strtoul(argv[++i], nullptr, 10);
+            depth_given = true;
+        } else if (std::strcmp(argv[i], "--bench") == 0) {
+            bench = true;
+        } else if (std::strcmp(argv[i], "--repeats") == 0 && has_value) {
+            repeats = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--warmup-sec") == 0 && has_value) {
+            warmup_sec = std::strtod(argv[++i], nullptr);
         } else if (std::strcmp(argv[i], "--k1") == 0 && has_value) {
             params.k1 = std::strtod(argv[++i], nullptr);
         } else if (std::strcmp(argv[i], "--b") == 0 && has_value) {
@@ -216,6 +304,10 @@ int main(int argc, char** argv) {
         const bm25::Corpus corpus = bm25::Corpus::load(data_dir);
         if (!ablations_path.empty()) {
             return run_ablations(corpus, ablations_path, runs_dir);
+        }
+        if (bench) {
+            // Benchmark top-10 retrieval unless a depth was asked for.
+            return run_bench(corpus, opts, params, depth_given ? depth : 10, repeats, warmup_sec);
         }
 
         const bm25::Tokenizer tokenizer(opts);
