@@ -39,6 +39,18 @@ public:
     // Replaces any previous contents. One pass over the documents.
     void build(const std::vector<Document>& docs, const Tokenizer& tokenizer);
 
+    // Binary persistence. The file records the tokenizer options the index was
+    // built with, so a loaded index can be queried with a matching Tokenizer.
+    // Format (native little-endian, see NOTES.md Phase 6): magic "BM25IDX\0",
+    // version, tokenizer flags, N, avgdl, external ids, doc lengths, then for
+    // each term id: term string, posting count, raw postings.
+    // Both throw std::runtime_error on I/O errors or a malformed file.
+    void save(const std::string& path) const;
+    static InvertedIndex load(const std::string& path);
+
+    // Options of the tokenizer used by build() (or stored in a loaded file).
+    const TokenizerOptions& tokenizer_options() const { return tokenizer_options_; }
+
     // Posting list of `term` (already tokenized form). Empty if unknown.
     const std::vector<Posting>& postings(const std::string& term) const;
 
@@ -62,6 +74,7 @@ private:
     std::vector<std::uint32_t> doc_lengths_;
     std::vector<std::string> external_ids_;
     double avgdl_ = 0.0;
+    TokenizerOptions tokenizer_options_;
 };
 
 }  // namespace bm25

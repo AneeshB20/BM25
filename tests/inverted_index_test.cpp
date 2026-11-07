@@ -1,5 +1,10 @@
 #include "bm25/inverted_index.hpp"
 
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -126,4 +131,71 @@ TEST(InvertedIndex, RebuildReplacesContents) {
     EXPECT_EQ(idx.num_docs(), 1u);
     EXPECT_TRUE(idx.postings("cat").empty());
     EXPECT_EQ(idx.postings("zebra"), (Postings{{0, 1}}));
+}
+
+// ---------------------------------------------------------------------------
+// Save / load
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string temp_path(const std::string& name) {
+    return ::testing::TempDir() + "bm25_index_test_" + name;
+}
+
+}  // namespace
+
+TEST(InvertedIndexPersistence, RoundTripPreservesEverything) {
+    InvertedIndex idx;
+    idx.build(four_docs(), Tokenizer(TokenizerOptions{false, true}));
+    const std::string path = temp_path("roundtrip.bin");
+    idx.save(path);
+    const InvertedIndex loaded = InvertedIndex::load(path);
+
+    EXPECT_EQ(loaded.num_docs(), idx.num_docs());
+    EXPECT_EQ(loaded.avgdl(), idx.avgdl());  // exact: stored as raw double bits
+    EXPECT_EQ(loaded.tokenizer_options().remove_stopwords, false);
+    EXPECT_EQ(loaded.tokenizer_options().stem, true);
+    for (std::uint32_t d = 0; d < idx.num_docs(); ++d) {
+        EXPECT_EQ(loaded.doc_length(d), idx.doc_length(d));
+        EXPECT_EQ(loaded.external_id(d), idx.external_id(d));
+    }
+    for (const char* term : {"the", "cat", "sat", "on", "mat", "dog", "a", "bird", "unicorn"}) {
+        EXPECT_EQ(loaded.postings(term), idx.postings(term)) << term;
+    }
+    EXPECT_EQ(loaded.stats().vocab_size, idx.stats().vocab_size);
+    EXPECT_EQ(loaded.stats().total_postings, idx.stats().total_postings);
+}
+
+TEST(InvertedIndexPersistence, EmptyIndexRoundTrips) {
+    InvertedIndex idx;
+    idx.build({}, Tokenizer());
+    const std::string path = temp_path("empty.bin");
+    idx.save(path);
+    const InvertedIndex loaded = InvertedIndex::load(path);
+    EXPECT_EQ(loaded.num_docs(), 0u);
+    EXPECT_TRUE(loaded.postings("cat").empty());
+}
+
+TEST(InvertedIndexPersistence, MissingFileThrows) {
+    EXPECT_THROW(InvertedIndex::load("/nonexistent/index.bin"), std::runtime_error);
+}
+
+TEST(InvertedIndexPersistence, WrongMagicThrows) {
+    const std::string path = temp_path("garbage.bin");
+    std::ofstream(path, std::ios::binary) << "definitely not an index file";
+    EXPECT_THROW(InvertedIndex::load(path), std::runtime_error);
+}
+
+TEST(InvertedIndexPersistence, TruncatedFileThrows) {
+    InvertedIndex idx;
+    idx.build(four_docs(), Tokenizer());
+    const std::string full = temp_path("full.bin");
+    idx.save(full);
+    std::ifstream in(full, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_GT(bytes.size(), 10u);
+    const std::string cut = temp_path("cut.bin");
+    std::ofstream(cut, std::ios::binary) << bytes.substr(0, bytes.size() - 5);
+    EXPECT_THROW(InvertedIndex::load(cut), std::runtime_error);
 }
