@@ -1,0 +1,5 @@
+# Extra Python deps for scripts/dense_baseline.py (Phase 7 comparison only).
+# Install the CPU build of torch first to avoid a multi-GB CUDA download:
+#   .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   .venv/bin/pip install -r scripts/requirements-dense.txt
+sentence-transformers
