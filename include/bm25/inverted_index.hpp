@@ -29,6 +29,11 @@ struct IndexStats {
 // Term -> posting list, plus per-document lengths. Doc ids are the positions
 // of the documents passed to build(), and every posting list is sorted by
 // ascending doc id (a consequence of building in doc-id order).
+//
+// Terms are interned: a hash map gives each distinct term a dense integer id
+// (in order of first appearance), and posting lists live in a vector indexed
+// by that id. Building then hashes each token's string once; everything after
+// that works on integers.
 class InvertedIndex {
 public:
     // Replaces any previous contents. One pass over the documents.
@@ -52,7 +57,8 @@ public:
     IndexStats stats() const;
 
 private:
-    std::unordered_map<std::string, std::vector<Posting>> postings_;
+    std::unordered_map<std::string, std::uint32_t> term_ids_;  // term -> term id
+    std::vector<std::vector<Posting>> postings_;              // indexed by term id
     std::vector<std::uint32_t> doc_lengths_;
     std::vector<std::string> external_ids_;
     double avgdl_ = 0.0;
