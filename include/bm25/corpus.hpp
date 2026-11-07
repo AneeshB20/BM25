@@ -8,8 +8,9 @@ namespace bm25 {
 
 // One retrievable document. `text` is the BEIR title and body joined by a space.
 struct Document {
-    std::string id;    // external id from corpus.jsonl ("_id")
-    std::string text;  // title + " " + text
+    std::string id = {};     // external id from corpus.jsonl ("_id")
+    std::string text = {};   // title + " " + text: what gets indexed
+    std::string title = {};  // title alone, for display (optional in tests)
 };
 
 struct Query {

@@ -47,7 +47,8 @@ std::vector<Document> Corpus::load_documents(const std::string& path) {
         }
         Document doc;
         doc.id = string_field(obj, "_id");
-        doc.text = string_field(obj, "title") + " " + string_field(obj, "text");
+        doc.title = string_field(obj, "title");
+        doc.text = doc.title + " " + string_field(obj, "text");
         docs.push_back(std::move(doc));
     }
     return docs;

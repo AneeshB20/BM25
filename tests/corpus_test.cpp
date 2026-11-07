@@ -30,6 +30,7 @@ TEST(Corpus, JoinsTitleAndTextWithSpace) {
     ASSERT_EQ(docs.size(), 2u);
     EXPECT_EQ(docs[0].id, "d1");
     EXPECT_EQ(docs[0].text, "Hello world");
+    EXPECT_EQ(docs[0].title, "Hello");
     EXPECT_EQ(docs[1].id, "d2");
     EXPECT_EQ(docs[1].text, " no title");
 }
