@@ -13,7 +13,11 @@ include(GoogleTest)
 add_executable(bm25_tests
   placeholder_test.cpp
   corpus_test.cpp
+  tokenizer_test.cpp
+  porter_stemmer_test.cpp
 )
 target_link_libraries(bm25_tests PRIVATE bm25 GTest::gtest_main)
 bm25_set_warnings(bm25_tests)
+# Lets tests find optional reference data under data/ (e.g. the Porter vocabulary).
+target_compile_definitions(bm25_tests PRIVATE BM25_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 gtest_discover_tests(bm25_tests)
