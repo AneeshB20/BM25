@@ -1,0 +1,5 @@
+# Python helpers only (evaluation and the dense baseline); the engine is C++.
+# pytrec-eval-terrier ships prebuilt wheels of pytrec_eval (same import name).
+cmake>=3.16
+pytrec-eval-terrier
+numpy
