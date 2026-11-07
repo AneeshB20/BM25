@@ -569,3 +569,136 @@ distinct matching documents (M ≤ Σp_i ≤ N):
    Python implementation that builds its own index from shared tokens and agrees on all
    300 queries with identical doubles (only print rounding differs); and edge-case tests
    for empty, unknown and stopword-only queries, k = 0, k > matches, and ties.
+
+---
+
+## Phase 5: Evaluation on SciFact
+
+### What was built
+
+- `Metrics` (`include/bm25/metrics.hpp`): `ndcg_at_k` and `recall_at_k`, written by
+  hand and matching trec_eval's definitions (linear gain, log2(rank+1) discount, ideal
+  DCG built from *all* judged relevant documents, not only the retrieved ones).
+  9 unit tests with hand-derived expected values.
+- `apps/bm25_eval`: runs all 300 judged test queries at depth 100, writes
+  `results/bm25_run.trec` (`qid Q0 docid rank score bm25`) and per-query metrics in
+  `results/bm25_metrics.tsv`, and prints the means. `--ablations FILE` runs the
+  tokenizer ablations and the k1 × b grid and writes `results/ablations.md`.
+- `scripts/eval.py`: evaluates any run file with **pytrec_eval** (the official trec_eval
+  C code wrapped for Python) and, with `--cpp-metrics`, compares the C++ numbers per
+  query and on the mean. It averages over *all* qrels queries, counting a query with no
+  results as 0, because pytrec_eval on its own silently drops such queries and inflates
+  the mean.
+- Environment note: the `pytrec_eval` package didn't compile here (no Python headers,
+  and no sudo to install them), so `scripts/requirements.txt` uses
+  `pytrec-eval-terrier`. It ships prebuilt wheels of the same code under the same
+  import name.
+
+### Main result
+
+```
+$ ./build/apps/bm25_eval
+config:      stem=on stopwords=on k1=0.90 b=0.40 depth=100
+queries:     300
+nDCG@10:     0.6774
+Recall@100:  0.9287
+```
+
+**nDCG@10 = 0.6774**, inside the 0.66–0.68 target, so the parameters were left alone.
+
+Cross-check against pytrec_eval:
+
+```
+$ .venv/bin/python scripts/eval.py results/bm25_run.trec --cpp-metrics results/bm25_metrics.tsv
+results/bm25_run.trec: queries=300 missing_from_run=0 nDCG@10=0.6774 Recall@100=0.9287
+C++ vs pytrec_eval:
+  ndcg_cut_10  C++ 0.677399  pytrec_eval 0.677399  |diff of means| 9.12e-08  max per-query |diff| 4.80e-07  OK (tol 0.001)
+  recall_100   C++ 0.928667  pytrec_eval 0.928667  |diff of means| 3.33e-07  max per-query |diff| 0.00e+00  OK (tol 0.001)
+```
+
+The C++ and trec_eval numbers agree to within 5e-7 on *every* query, far inside the
+0.001 tolerance. What's left is the 6-decimal rounding in the TSV. All 10 ablation run
+files were also re-scored with pytrec_eval, and every one reproduces the table below.
+
+### Ablations (`results/ablations.md`, from `bm25_eval --ablations results/ablations.md`)
+
+| Configuration (k1 = 0.9, b = 0.4) | Vocabulary | nDCG@10 | Recall@100 |
+|---|---:|---:|---:|
+| no stemming, no stopwords | 35734 | 0.6588 | 0.8886 |
+| stopwords only | 35701 | 0.6608 | 0.8859 |
+| stemming only | 26176 | 0.6812 | 0.9297 |
+| stemming + stopwords (main) | 26156 | 0.6774 | 0.9287 |
+
+| k1 | b | nDCG@10 | Recall@100 |
+|---:|---:|---:|---:|
+| 0.9 | 0.40 | 0.6774 (main) | 0.9287 |
+| 0.9 | 0.75 | 0.6831 | 0.9280 |
+| 1.2 | 0.40 | 0.6789 | 0.9276 |
+| 1.2 | 0.75 | 0.6879 | 0.9276 |
+| 1.5 | 0.40 | 0.6834 | 0.9242 |
+| 1.5 | 0.75 | 0.6931 | 0.9242 |
+
+Per-query breakdown (from pytrec_eval on the ablation runs):
+- stemming vs. no stemming (stopwords off): 37 queries better, 29 worse, 234 unchanged;
+- adding stopwords on top of stemming: 10 better, 11 worse, 279 unchanged;
+- main configuration: 53 of the 300 queries have nDCG@10 = 0 (no relevant document in
+  the top 10).
+
+### What nDCG@10 measures, in plain words
+
+Look at the top 10 results. Each relevant document earns points, and it earns more the
+higher it is ranked: a hit at rank 1 is worth 1, at rank 2 about 0.63, at rank 10 about
+0.29 (1/log2(rank+1)). Add up the points (DCG) and divide by the best score possible
+for that query, if every relevant document had been placed at the top (ideal DCG). So
+1.0 means "every relevant document is at the top" and 0 means "none in the top 10". The
+final number is the average over the 300 queries. SciFact queries have only 1–5
+relevant documents each (339 judgements for 300 queries), so in practice nDCG@10 mostly
+measures *how high the first relevant abstract appears*.
+
+**Recall@100** is simpler: what fraction of the relevant documents appear anywhere in
+the top 100. It matters when BM25 is the first stage of a pipeline and a re-ranker
+reorders those 100. Ours is 0.93: a re-ranker would get to see 93% of what it needs.
+
+### What the ablations taught us
+
+1. **Stemming is the big win:** +0.022 nDCG@10 and +0.041 Recall@100. It shrinks the
+   vocabulary by 27% (35,734 → 26,156 terms) by merging forms like
+   infection/infections/infected. As expected, it helps recall most. It is not a free
+   lunch: it hurt 29 queries, the over-stemming cost described in Phase 2.
+2. **Stopword removal barely matters here.** The Lucene list has only 33 words, and BM25's
+   IDF already gives words like "the" (which appear in almost every document) a weight
+   close to zero. The −0.004 versus "stemming only" comes from 10 queries winning and
+   11 losing: noise, not a real effect. Stopwords still earn their place by making
+   posting lists shorter (faster queries and a smaller index), not by improving quality.
+3. **The k1/b grid prefers more tf weight and more length normalisation** (k1 = 1.5,
+   b = 0.75 gives 0.6931). **We did not adopt it.** The grid was evaluated on the *test*
+   queries, so picking the best cell would be tuning on the test set, and the number
+   would be optimistic. The honest options are to keep the published defaults (which
+   we did) or to tune on SciFact's separate train split and report test once.
+   Recall@100 moves the other way (0.9287 → 0.9242), a reminder that the parameters
+   trade top-heavy precision against depth.
+4. **We land near the Anserini baseline without tuning**, which is evidence that the
+   tokenizer and formula are right. Earlier phases verified correctness against a
+   reference implementation; this phase checks quality against a published result.
+
+### Complexity
+
+- Evaluating one query: O(search) + O(k log R) for the R judged documents
+  (`std::map` lookups). Building the ideal DCG is O(R log R). Negligible next to search.
+- The whole run: 300 searches; a single untimed pass took about 150 ms in total. Proper
+  latency numbers come in Phase 6.
+
+### Likely interview questions
+
+1. **Why nDCG instead of precision@10?** Precision treats rank 1 and rank 10 the same,
+   while users mostly look at the top. nDCG discounts by position, supports graded
+   relevance, and normalises per query, so queries with 1 or 5 relevant documents are
+   comparable.
+2. **Your parameter grid found 0.693; why report 0.677?** Because the grid was run on the
+   test set. Choosing the best test-set configuration is overfitting the benchmark. The
+   0.677 uses published defaults, chosen before looking at test results. To tune
+   properly, I would use the train split.
+3. **How do you know your nDCG code is right?** It agrees with trec_eval (via
+   pytrec_eval) to within 5e-7 on every one of the 300 queries, and the unit tests check
+   hand-derived cases: a perfect ranking, the cutoff, graded gain, an ideal DCG that
+   includes unretrieved relevant documents, and no relevant documents at all.
