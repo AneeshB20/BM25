@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -21,6 +22,15 @@ struct RanksHigher {
 
 Searcher::Searcher(const InvertedIndex& index, const Tokenizer& tokenizer, Bm25Params params)
     : index_(index), tokenizer_(tokenizer), scorer_(index.num_docs(), index.avgdl(), params) {
+    // Outside these ranges BM25 is not meaningful, and scores can become zero,
+    // negative or infinite, which the dense accumulator's "0.0 = untouched"
+    // sentinel does not allow.
+    if (!(params.k1 >= 0.0)) {
+        throw std::invalid_argument("BM25 k1 must be >= 0");
+    }
+    if (!(params.b >= 0.0 && params.b <= 1.0)) {
+        throw std::invalid_argument("BM25 b must be in [0, 1]");
+    }
     length_norms_.reserve(index_.num_docs());
     for (std::uint32_t d = 0; d < index_.num_docs(); ++d) {
         length_norms_.push_back(scorer_.length_norm(index_.doc_length(d)));

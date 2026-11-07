@@ -21,6 +21,7 @@ struct SearchResult {
 // with, otherwise query terms will not match index terms.
 class Searcher {
 public:
+    // Throws std::invalid_argument unless k1 >= 0 and 0 <= b <= 1.
     Searcher(const InvertedIndex& index, const Tokenizer& tokenizer, Bm25Params params = {});
 
     // Top-k documents by BM25 score, best first. Equal scores are ordered by

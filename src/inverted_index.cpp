@@ -237,6 +237,16 @@ InvertedIndex InvertedIndex::load(const std::string& path) {
         idx.external_ids_.push_back(r.string());
     }
     r.array(idx.doc_lengths_, num_docs);
+    {
+        // avgdl must be exactly what build() computes from the doc lengths.
+        std::uint64_t total = 0;
+        for (std::uint32_t len : idx.doc_lengths_) total += len;
+        const double expected =
+            num_docs == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(num_docs);
+        if (idx.avgdl_ != expected) {
+            throw std::runtime_error(path + ": avgdl does not match document lengths");
+        }
+    }
 
     const auto vocab = r.value<std::uint64_t>();
     idx.term_ids_.reserve(vocab);
@@ -248,6 +258,16 @@ InvertedIndex InvertedIndex::load(const std::string& path) {
             throw std::runtime_error(path + ": corrupt posting count");
         }
         r.array(idx.postings_[id], count);
+        // The searcher indexes arrays by doc_id and relies on every posting
+        // contributing a positive score, so reject anything a build() could
+        // not have produced: doc ids in range and strictly ascending, tf >= 1.
+        const std::vector<Posting>& plist = idx.postings_[id];
+        for (std::size_t i = 0; i < plist.size(); ++i) {
+            if (plist[i].doc_id >= num_docs || plist[i].tf == 0 ||
+                (i > 0 && plist[i].doc_id <= plist[i - 1].doc_id)) {
+                throw std::runtime_error(path + ": corrupt posting list for term '" + term + "'");
+            }
+        }
         if (!idx.term_ids_.emplace(std::move(term), static_cast<std::uint32_t>(id)).second) {
             throw std::runtime_error(path + ": duplicate term");
         }
