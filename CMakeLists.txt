@@ -35,6 +35,7 @@ add_library(bm25
   src/inverted_index.cpp
   src/bm25_scorer.cpp
   src/searcher.cpp
+  src/metrics.cpp
 )
 target_include_directories(bm25 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(bm25 PRIVATE nlohmann_json::nlohmann_json)
