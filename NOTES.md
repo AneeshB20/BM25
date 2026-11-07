@@ -411,3 +411,161 @@ Let T be the total tokens (850,090), V the vocabulary (26,156), P the total post
    merge (SPIMI / external merge sort). Posting lists would be delta-encoded and
    compressed (variable-byte or PForDelta), and the dictionary would map each term to a
    file offset.
+
+---
+
+## Phase 4: BM25 scoring and top-k
+
+### What was built
+
+- `Bm25Scorer` (`include/bm25/bm25_scorer.hpp`): `idf(doc_freq)` and
+  `term_score(idf, tf, doc_len)`, using exactly the CLAUDE.md formula with k1 and b as
+  parameters. It holds only N, avgdl, k1 and b; it doesn't know about the index, which
+  makes it trivial to unit-test.
+- `Searcher` (`include/bm25/searcher.hpp`): `search(query, k)`:
+  1. tokenize with the same options as the index;
+  2. drop repeated terms, keeping first-occurrence order;
+  3. **term-at-a-time** scoring: for each term, compute idf once, then walk its
+     posting list and add `term_score` into an `unordered_map<doc_id, double>`
+     accumulator;
+  4. select the top-k with a **size-k min-heap** (`std::priority_queue` whose top is
+     the worst result kept so far);
+  5. pop and reverse into best-first order. Ties go to the lower doc id, so output is
+     deterministic even though the hash-map iteration order is not.
+- `apps/bm25_search --batch`: reads `qid<TAB>text` from stdin and writes a TREC run
+  with scores printed to 9 decimal places.
+- `apps/bm25_index --export-tokens DIR`: writes the C++ tokenizer's output for every
+  document and judged test query.
+- `scripts/reference_bm25.py`: a separate, deliberately simple Python BM25. It reads
+  the exported tokens, builds its own postings with `Counter`, scores with the same
+  formula, ranks with a full `sorted()`, and then calls the C++ binary on the same
+  queries and compares.
+
+### Evidence
+
+Unit tests (21 new; scores computed by hand in the test comments, asserted to 1e-6):
+
+```
+$ ctest --test-dir build --output-on-failure
+...
+100% tests passed out of 59
+```
+
+Python cross-check:
+
+```
+$ build/apps/bm25_index --export-tokens data/scifact/tokens
+$ python3 scripts/reference_bm25.py
+reference index: 5183 docs, 26156 terms, avgdl 164.0150
+queries compared: 50 (seed 42, top-10, k1=0.9, b=0.4)
+max |score diff|: 4.992e-10 (tolerance 1e-06)
+matched: 50/50
+```
+
+Going beyond the requirement: all 300 queries match with the defaults (300/300, max
+diff 4.993e-10), and also with top-100 at k1=1.2, b=0.75 (300/300, max diff 5.000e-10).
+The ~5e-10 is only the rounding from printing 9 decimals. The doubles themselves are
+identical, because both sides apply the same operations in the same order.
+
+Edge cases. The unit tests cover an empty query, a punctuation-only query, unknown
+terms, unknown terms mixed with known ones, k = 0, k larger than the number of matches,
+a stopword-only query, and equal-score ties. On SciFact itself, with `-k 1000`:
+`zzqxv qqqzzk` → 0 lines, an empty query → 0 lines, `the of and is` → 0 lines,
+`parthenogenesis` → 2 lines (and the stemmed term `parthenogenesi` is in exactly 2
+documents).
+
+### The formula, term by term
+
+```
+idf(t)  = ln(1 + (N - n_t + 0.5) / (n_t + 0.5))
+score  += idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+```
+
+- **N** is the number of documents and **n_t** the number containing term t. The ratio
+  `(N - n_t + 0.5) / (n_t + 0.5)` is roughly "documents without t / documents with t":
+  the odds against a random document containing t. Rare terms have high odds, so they
+  carry more information. The 0.5s are smoothing, so n_t = 0 or n_t = N never divides
+  by zero.
+- **The `1 +` inside the log** is the Lucene variant's fix. Classic Robertson–Spärck
+  Jones IDF, `ln((N - n + 0.5)/(n + 0.5))`, goes *negative* for terms in more than half
+  the documents, so matching a common word would lower a document's score. With `1 +`,
+  IDF is always > 0. In the test corpus a term in all 4 documents still gets
+  ln(10/9) ≈ 0.105.
+- **tf** is how often t appears in the document. More occurrences is more evidence,
+  but with diminishing returns.
+- **`tf * (k1 + 1) / (tf + K)`** is the saturation curve. As tf → ∞ it approaches
+  `k1 + 1`. The tenth "cancer" in a document adds much less than the first. The
+  `(k1 + 1)` factor only scales the result so that tf = 1 gives about 1 in an
+  average-length document; it doesn't change any ranking.
+- **`K = k1 * (1 - b + b * dl / avgdl)`** is length normalisation. A document twice as
+  long as average gets a larger K, so each occurrence counts for less, because long
+  documents mention many words just by being long.
+
+**What k1 controls:** how fast tf saturates. k1 = 0 ignores tf entirely (a binary
+"contains the term" model); a large k1 makes the score close to linear in tf. Our
+k1 = 0.9 saturates fairly quickly. In the tests, tf = 1000 gives 1.89 against a
+ceiling of 1.9.
+
+**What b controls:** how strongly document length is normalised, from 0 to 1. b = 0
+means no normalisation (test `BZeroIgnoresLength`); b = 1 means fully dividing by
+relative length. b = 0.4 is mild. SciFact abstracts are fairly uniform in length, and
+long abstracts are not mostly padding.
+
+### Why repeated query terms count once
+
+A query like "cancer cells and cancer risk" says "cancer" twice because of grammar, not
+because the user wants "cancer" weighted double. Counting once makes the score a
+function of the *set* of query terms, which is the behaviour the prompt asked for and
+which the Python reference copies with `dict.fromkeys`. Note that this differs from
+Anserini, whose bag-of-words query boosts a repeated term by its count (see Phase 0
+risks). For short SciFact claims it rarely matters. If it did, it would be a one-line
+change: multiply the term's contribution by its query count.
+
+### Design choices
+
+- **Term-at-a-time with an accumulator** is the simplest correct strategy. The
+  alternative, document-at-a-time (merging the sorted posting lists with a cursor per
+  term), uses less memory and enables WAND/MaxScore early termination, but it is more
+  complex. With 5,183 documents the accumulator is tiny.
+- **Hash-map accumulator for now.** A dense `vector<double>(N)` would avoid hashing, but
+  it costs O(N) to clear on every query. Phase 6 will measure that trade instead of
+  guessing.
+- **Size-k min-heap rather than sorting.** For M matching documents, a full sort is
+  O(M log M); the heap is O(M log k) time and O(k) extra space. With k = 10 and M often
+  in the thousands, that is a real saving, and CLAUDE.md requires it.
+- **double, not float**, for scores. It gives about 16 significant digits, so summation
+  order barely matters and the 1e-6 cross-check is easy to meet.
+- **The C++ expression order matches the formula** (`b * dl / avgdl`, not
+  `b * (dl / avgdl)`). The two round differently, and keeping them the same is what
+  makes the C++ and Python doubles identical.
+- **Why the Python side reads exported tokens:** CLAUDE.md forbids re-implementing the
+  engine in Python, and sharing the tokens means any mismatch must come from
+  indexing/scoring. The tokenizer has its own unit tests and a 23,531-word stemmer test.
+
+### Complexity
+
+For a query with q unique terms, posting-list lengths p_1..p_q, and M = number of
+distinct matching documents (M ≤ Σp_i ≤ N):
+
+- Tokenizing the query: O(query length).
+- Scoring: O(Σ p_i) expected (one accumulator update per posting).
+- Top-k: O(M log k) time, O(k) space for the heap.
+- Accumulator space: O(M).
+- Total: O(Σ p_i + M log k). The cost is driven by how common the query terms are,
+  not by N. That's the whole point of an inverted index.
+
+### Likely interview questions
+
+1. **Why a min-heap for top-k, and why "min"?** We want the k *largest* scores. The heap
+   keeps the k best seen so far with the *smallest* of them on top, so for each new
+   candidate one comparison against the top decides whether it gets in. If it does, we
+   pop the smallest and push the new one in O(log k). A max-heap of all M candidates
+   would need O(M) space and O(M + k log M) time.
+2. **Can a common term ever lower a document's score?** Not with this IDF. The `1 +`
+   inside the log keeps IDF positive, so every matching term adds a positive amount.
+   With the classic RSJ IDF it could, for terms in more than half the documents.
+3. **How did you verify the scorer is correct?** In three independent ways: unit tests
+   whose expected values were derived as exact fractions in the comments; a separate
+   Python implementation that builds its own index from shared tokens and agrees on all
+   300 queries with identical doubles (only print rounding differs); and edge-case tests
+   for empty, unknown and stopword-only queries, k = 0, k > matches, and ties.
