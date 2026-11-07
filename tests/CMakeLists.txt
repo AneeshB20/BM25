@@ -15,6 +15,7 @@ add_executable(bm25_tests
   corpus_test.cpp
   tokenizer_test.cpp
   porter_stemmer_test.cpp
+  inverted_index_test.cpp
 )
 target_link_libraries(bm25_tests PRIVATE bm25 GTest::gtest_main)
 bm25_set_warnings(bm25_tests)

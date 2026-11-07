@@ -313,3 +313,101 @@ It is deliberately short. Words like "we", "were", "has" and "can" are **not** i
    part-of-speech tags, which is slower and language-specific. For ranking, all we
    need is that related forms collide, and they don't need to be real words. Porter is
    fast, deterministic and is what the Anserini baseline we compare against uses.
+
+---
+
+## Phase 3: Inverted index
+
+### What was built
+
+- `InvertedIndex` (`include/bm25/inverted_index.hpp`):
+  `unordered_map<string, vector<Posting{doc_id, tf}>>`, plus a
+  `vector<uint32_t> doc_lengths_` indexed by doc id, the external id strings, and
+  `avgdl`.
+- `build(docs, tokenizer)` makes one pass. For each document: tokenize, count term
+  frequencies in a reusable per-document hash map, then append one `Posting` to each
+  term's list. Documents are visited in increasing doc-id order, so every posting list
+  comes out sorted with no sort step.
+- Accessors: `postings(term)` (returns a shared static empty vector for unknown terms,
+  so callers never need a null check), `doc_freq`, `doc_length`, `num_docs`, `avgdl`,
+  `external_id`, and `stats()`.
+- `apps/bm25_index`: loads SciFact, times the build and prints the statistics.
+  `--no-stem` and `--no-stopwords` are there for the ablations.
+- 10 tests on a hand-made 4-document corpus that assert exact postings, document
+  frequencies, document lengths and avgdl, both with and without stopwords. Edge cases:
+  an empty document, an empty corpus, and rebuilding.
+
+### Evidence
+
+```
+$ ctest --test-dir build --output-on-failure
+100% tests passed out of 38
+
+$ ./build/apps/bm25_index
+tokenizer:        stopwords=on stem=on
+corpus load:      127.1 ms
+index build:      386.9 ms (tokenize + invert)
+documents:        5183
+vocabulary size:  26156
+total postings:   512968
+total tokens:     850090
+avgdl (tokens):   164.0150
+memory (approx):  7.83 MB
+```
+
+Build time is noisy on this machine: four Release runs gave 580.3, 576.9, 499.2 and
+386.9 ms. Phase 6 will measure it properly, with repeats.
+
+### How the memory number is computed
+
+`stats()` adds up what the containers own: for each hash-map node, its key string
+object, vector object, next pointer and cached hash; key characters that don't fit in
+the small-string buffer; posting-list *capacity* × 8 bytes; the bucket array; and the
+doc lengths and external ids. It ignores allocator headers and padding, so the real
+resident size is somewhat higher. Postings dominate: 512,968 × 8 B ≈ 3.9 MB of the 7.83.
+
+### Design choices
+
+- **Hash map, not a sorted map (`std::map`).** The only query operation is "give me
+  the list for exactly this term". A hash map does that in expected O(1) (after
+  hashing the term); a red-black tree takes O(log V) string comparisons (about 15 for
+  V = 26k) and chases pointers between scattered nodes. A sorted map would only pay off
+  for prefix or wildcard queries ("vitam*") or for writing terms in order. We don't
+  support those queries, and if we save the index we can sort at that point.
+- **`uint32_t` doc ids and tf.** 4 billion documents is plenty, and an 8-byte Posting
+  halves memory compared with two `size_t`s, which also means more postings per cache
+  line during scoring.
+- **Doc length = tokens after stopword removal.** That is what Lucene counts (the tokens
+  actually indexed). The length is what BM25 normalises by, so it must count the same
+  units as tf.
+- **Reusing the per-document `tf` map** (`clear()` keeps its buckets) avoids reallocating
+  a hash table for each of the 5,183 documents.
+
+### Complexity
+
+Let T be the total tokens (850,090), V the vocabulary (26,156), P the total postings
+(512,968), N the number of documents and L the average token length.
+
+- **Build:** O(T·L) expected time. Tokenizing is linear in the characters. Each token
+  costs one hash of its characters plus an expected O(1) map update. Appending postings
+  is amortised O(1) per posting, and P ≤ T.
+- **Term lookup:** O(L) expected for the hash, plus O(1) for the bucket. The worst case
+  (every term in one bucket) is O(V), which doesn't happen in practice with a decent hash.
+- **Space:** O(V·L + P + N).
+
+### Likely interview questions
+
+1. **Why are posting lists sorted by doc id, and how do you guarantee it?** Sorted
+   lists allow linear-time intersection and merging (AND queries, document-at-a-time
+   scoring, skip pointers) and compress well with delta encoding. We guarantee it for
+   free by building in doc-id order and only ever appending.
+2. **Hash map vs trie vs sorted array for the dictionary?** A hash map is fastest for
+   exact lookups. A trie or FST supports prefixes and shares common prefixes, which saves
+   memory (Lucene uses an FST). A sorted array with binary search is compact and good for
+   an on-disk index. For an in-memory exact-match engine, a hash map is the simplest
+   choice that is also fast.
+3. **What would change for a corpus that doesn't fit in memory?** Index in blocks: build
+   partial in-memory indexes, write each one sorted by term to disk, then do a k-way
+   merge (SPIMI / external merge sort). Posting lists would be delta-encoded and
+   compressed (variable-byte or PForDelta), and the dictionary would map each term to a
+   file offset.
