@@ -59,6 +59,10 @@ construction.
 | Load saved index | **5.7** [5.7, 5.6, 5.7] | file in the OS page cache |
 | Saved file size | 4.45 MiB (4,668,814 bytes) | `corpus.jsonl` is 7.73 MiB (8,106,566 bytes) |
 
+Re-measured after Phase 8 added full posting validation to `load`: load 5.7 ms
+[5.7, 5.8, 5.7], rebuild 150.7 ms [150.3, 150.7, 151.9]. The validation cost is not
+measurable.
+
 Loading is about **27× faster** than rebuilding. That understates the gap, because a
 rebuild also has to parse `corpus.jsonl` first (`bm25_index` reported a corpus load of
 168.5–169.0 ms in three runs without warm-up). The benchmark also checked that the

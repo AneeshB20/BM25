@@ -58,7 +58,7 @@ export PATH="$PWD/.venv/bin:$PATH"       # only needed if cmake comes from the v
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 74 tests
+ctest --test-dir build --output-on-failure   # 77 tests
 ```
 
 ## Data
@@ -212,7 +212,9 @@ first even though neither system had it in its own top 10.
   Python reference produce bit-identical numbers. Optimisations that would reorder
   floating-point operations were rejected.
 - **Binary index file** that stores the tokenizer options, so a loaded index is always
-  queried with matching analysis. It is not portable across endianness, and there is no
+  queried with matching analysis. Loading validates every posting (doc id in range and
+  ascending, tf ≥ 1) and avgdl, so a corrupt file is rejected instead of crashing the
+  searcher. It is not portable across endianness, and there is no
   compression.
 
 ## Complexity
@@ -231,7 +233,7 @@ term i, M = number of matching documents.
 
 ## Verification
 
-- 74 GoogleTest unit tests, covering every class (`tests/`).
+- 77 GoogleTest unit tests, covering every class (`tests/`).
 - `PorterStemmer` matches the official 23,531-word vocabulary exactly.
 - BM25 scores derived by hand as exact fractions in the test comments (1e-6).
 - `scripts/reference_bm25.py`: an independent Python BM25 built from the exported

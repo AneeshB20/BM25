@@ -801,7 +801,7 @@ u64 V, then V × (u32 len, term bytes, u64 count, count × {u32 doc_id, u32 tf})
 - **Defensive loading:** the magic number, version, a document-count bound, a posting
   count ≤ N, no duplicate terms, no truncation and no trailing bytes are all checked, and
   each failure throws. Five tests cover the round trip, an empty index, a missing file,
-  wrong magic, and truncation.
+  wrong magic, and truncation. *(Phase 8's review found this wasn't enough. See Phase 8.)*
 - Numbers: file 4.45 MiB (the corpus JSONL is 7.73 MiB); load 5.7 ms against 152.5 ms
   to rebuild, about 27× faster, before even counting the ~169 ms of JSON parsing a
   rebuild also needs. The loaded index gives identical results on all 300 queries.
@@ -947,3 +947,105 @@ and gives the same numbers. BM25 latency here is for **top-100** (43.1 µs), ver
    the query encoder or run it on a GPU, use a smaller or distilled model, cache frequent
    queries, and replace exact search with HNSW. Or keep BM25 as a cheap first stage and
    use the neural model only to re-rank its top 100.
+
+---
+
+## Phase 8: CLI, README and review
+
+### What was built
+
+- `apps/bm25_search` is now interactive by default:
+  `bm25_search --index data/scifact/index.bin -k 10` reads one query per line and prints
+  rank, doc id, score and the first 100 bytes of the title (cut back to a UTF-8
+  character boundary so a multi-byte character is never split). It shows a `query>`
+  prompt only when stdin is a terminal, so piped output stays clean. `--batch` (used by
+  the Python cross-check) still works. The index's stored tokenizer options are used
+  automatically. `Document` gained a `title` field for display.
+- `README.md`: summary, Mermaid architecture diagram, build/data/tool instructions,
+  every results table copied from `results/`, design trade-offs, complexity, and how
+  correctness is verified.
+
+### The review
+
+A separate subagent reviewed the whole repository against CLAUDE.md (read-only). It
+confirmed: the formula matches CLAUDE.md in C++ and Python; top-k uses a size-k heap; no
+IR libraries; Python is never the engine; one class per header; every README number
+matches a file in `results/` (it checked each one); no unused files; every class has
+tests; `ctest` and `scripts/verify.sh` pass. It also judged the Phase 6 change to the
+postings layout to be adequately documented.
+
+It found two real defects, both now fixed:
+
+1. **A corrupt index file could crash the searcher.** `load` checked counts but not
+   posting contents. The reviewer patched one doc id in a copy of `index.bin` to 4e9 and
+   got a segfault, because the searcher indexes `acc[doc_id]` without a bounds check. A
+   `tf = 0` posting would also break the "score 0.0 = untouched" sentinel and could list
+   a document twice. **Fix:** `load` now rejects any posting with `doc_id ≥ N`, `tf = 0`
+   or a non-ascending doc id, and checks that the stored avgdl equals the one recomputed
+   from the doc lengths. Two new tests patch a saved file's bytes (`OutOfRangeDocIdThrows`,
+   `ZeroTfThrows`). The reviewer's corrupt file now gives
+   `error: …: corrupt posting list for term 'microstructur'` (exit 1). Load time is
+   unchanged (5.7 ms).
+2. **CLI arguments were parsed with `strtoul`/`strtod`/`atoi` and no checks.** `-k abc`
+   became k = 0 (zero results, so nDCG 0, exit 0), and `--k1 -5` or `--b 2` produced
+   nonsense or negative scores. **Fix:** `apps/cli.hpp` parses strictly (the whole string
+   must be a number, within range): k ≥ 1, k1 in [0, 1e6], b in [0, 1], repeats ≥ 2. Bad
+   input prints an error and exits 2. `Searcher`'s constructor also throws
+   `std::invalid_argument` for k1 < 0 or b outside [0, 1], so library users are protected
+   too (test `RejectsInvalidParams`).
+
+Minor items fixed:
+- `bm25_eval` used to write `results/bm25_run.trec` even for experimental settings, which
+  could silently overwrite the committed results. It now writes there only for the main
+  configuration; anything else needs an explicit `--out`. It also warns when `-k` < 100
+  makes Recall@100 incomplete.
+- The ablation run-file names were built in a 128-byte buffer that could truncate a long
+  `--runs-dir`; they now use `std::string`.
+- The placeholder `1 + 1 == 2` test from Phase 1 was removed. Tests were added for
+  `Corpus::load` (whole directory) and `Corpus::judged_queries` (queries.jsonl order).
+
+Left as is: the CLAUDE.md "Postings" line still describes the original
+`unordered_map<string, vector<Posting>>`. CLAUDE.md is the owner's file, and the change
+is documented in the Phase 0 and Phase 6 notes. The loader does not detect a missing or
+duplicate `_id` in a corpus; neither occurs in SciFact.
+
+### Evidence after the fixes
+
+```
+$ cmake --build build --clean-first -j 2>&1 | grep -ci warning
+0
+$ ctest --test-dir build --output-on-failure
+100% tests passed out of 77
+$ scripts/verify.sh
+matched: 50/50
+nDCG@10:     0.6774
+Recall@100:  0.9287
+run file: identical to results/bm25_run.trec
+```
+
+The ASan + UBSan build also passes 77/77. Re-running `bm25_eval` and
+`bm25_eval --ablations` left every committed file in `results/` unchanged.
+
+### Complexity
+
+- Interactive query: the same as `Searcher::search`, plus O(k) for printing. Loading the
+  titles costs one parse of the corpus at startup.
+- Load validation: O(P), one pass over the postings that were just read. It doesn't show
+  up in the 5.7 ms.
+
+### Likely interview questions
+
+1. **What did the code review find that your tests didn't?** Two failure modes on
+   *untrusted input*: a malformed index file and malformed CLI arguments. Every test fed
+   well-formed data. The fix was to validate at the boundary (file load, argument
+   parsing) and keep the hot loop free of checks, which is why validation costs nothing
+   measurable.
+2. **Why validate in `load` instead of bounds-checking in the scoring loop?** The loop
+   runs ~4,500 times per query and the load runs once. Checking once at the trust
+   boundary establishes an invariant ("every doc_id < N, every tf ≥ 1") that the hot path
+   can then rely on.
+3. **How do you know the README numbers are real?** Every table is generated by a command
+   in the repo (`bm25_eval`, `bm25_eval --ablations`, `scripts/bench.sh`,
+   `scripts/dense_baseline.py`) and written to `results/`. An independent reviewer checked
+   each README number against those files. Quality numbers are cross-checked against
+   pytrec_eval, and rankings against a separate Python implementation.
