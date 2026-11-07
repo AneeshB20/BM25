@@ -836,3 +836,114 @@ u64 V, then V × (u32 len, term bytes, u64 count, count × {u32 doc_id, u32 tf})
    and getting different numbers, then fixed it with a 15 s warm-up and core pinning, and
    by reporting the median of three trials. Benchmarks are only worth trusting once
    repeated runs of the same code agree.
+
+---
+
+## Phase 7: Dense retrieval comparison
+
+### What was built
+
+`scripts/dense_baseline.py` (Python only, as CLAUDE.md requires):
+
+1. Encodes the 5,183 documents (title + " " + text, the same text BM25 indexes) and
+   the 300 judged queries with `sentence-transformers/all-MiniLM-L6-v2`
+   (384 dimensions, max 256 word pieces, L2-normalised). It retrieves the top-100 by
+   cosine similarity, which is a matrix-vector product of unit vectors followed by
+   `argpartition`. Writes `results/dense_run.trec`. Corpus embeddings are cached in
+   `data/dense/`.
+2. Fuses `results/bm25_run.trec` and the dense run with **Reciprocal Rank Fusion**:
+   `score(d) = Σ_runs 1 / (60 + rank_run(d))`. Writes `results/hybrid_run.trec`.
+3. Scores all three runs with the same `scripts/eval.py` code (pytrec_eval), runs the
+   C++ benchmark for BM25 latency, times dense queries one at a time, picks three example
+   queries automatically, and writes `results/comparison.md`.
+
+Environment: torch 2.15.0 (CPU wheel) and sentence-transformers 6.2.0, installed into
+`.venv` (`scripts/requirements-dense.txt`). Corpus encoding took 80.6 s using 8 torch
+threads; the CPU has 16 logical cores.
+
+### Results (`results/comparison.md`)
+
+```
+$ .venv/bin/python scripts/dense_baseline.py
+bm25    nDCG@10 0.6774  Recall@100 0.9287
+dense   nDCG@10 0.6451  Recall@100 0.9250
+hybrid  nDCG@10 0.7159  Recall@100 0.9550
+latency p50/p95: bm25 43.1/69.1 us, dense 12.64/17.48 ms, fusion 80.8 us/query
+```
+
+| Method | nDCG@10 | Recall@100 | Query latency p50 (p95) |
+|---|---:|---:|---:|
+| BM25 (C++) | 0.6774 | 0.9287 | 43.1 µs (69.1 µs) |
+| Dense MiniLM-L6 | 0.6451 | 0.9250 | 12.64 ms (17.48 ms) |
+| Hybrid RRF k=60 | **0.7159** | **0.9550** | ≈ sum of both + 81 µs |
+
+`scripts/eval.py results/dense_run.trec results/hybrid_run.trec` re-scores both files
+and gives the same numbers. BM25 latency here is for **top-100** (43.1 µs), versus
+27.7 µs for top-10 in Phase 6. The heap holds 100 entries and more results come back.
+
+### What the three examples show
+
+- **BM25 wins, query 48** ("…1,000 people in the UK are asymptomatic carriers of vCJD
+  infection"). BM25 ranks the relevant abstract (about abnormal prion protein in UK
+  appendixes) first, because rare exact terms like "vcjd" carry high IDF. Dense
+  retrieval drifts to generic UK infection and surveillance papers and misses it in the
+  top 100. **The hybrid also loses it** (rank 11): with RRF, a document ranked first by
+  one system and absent from the other scores 1/61 ≈ 0.0164, below documents both
+  systems ranked moderately well. Fusion is not free.
+- **Dense wins, query 1088** ("Silencing of Bcl2 is important for the maintenance and
+  progression of tumors"). The relevant title says "Antiapoptotic **BCL-2** is required
+  for **maintenance** of a model leukemia". Our tokenizer splits "BCL-2" into "bcl" + "2",
+  which doesn't match the query token "bcl2", and "leukemia" vs "tumors" is a semantic
+  link that lexical matching can't make. Dense ranks it 1st, BM25 72nd, and the hybrid
+  6th.
+- **Hybrid beats both, query 619** (vessel density, fibrosis, chemotherapy efficacy).
+  Both systems have a relevant document at rank 11, just outside the top 10. Because
+  each system ranks it reasonably, RRF lifts it to rank 1, and nDCG@10 goes from 0 to
+  0.613.
+
+### When I'd choose lexical, dense or hybrid in a real product
+
+- **Lexical (BM25)** when queries contain exact identifiers or rare jargon (gene names,
+  error codes, SKUs, legal citations, log search), when latency and cost matter (here it
+  was ~290× faster and needed no GPU, model or embedding pipeline), when results must be
+  explainable ("it matched these terms"), and when the index must update instantly. It
+  is also the safe default for a new domain: on SciFact, an out-of-domain general
+  embedding model was *worse* than BM25.
+- **Dense** when users paraphrase or ask natural-language questions whose wording differs
+  from the documents (support search, FAQ matching, cross-lingual search), when
+  vocabulary mismatch is the main failure, and when you can fine-tune the encoder on
+  in-domain data. You pay for model inference on every query, an ANN index at scale, and
+  re-embedding the corpus whenever the model changes.
+- **Hybrid** when quality matters most and you can afford both. The systems fail on
+  *different* queries, so fusing them recovers misses from each: here +0.039 nDCG@10 and
+  +0.026 Recall@100 over BM25. RRF needs no score calibration and no training, just
+  ranks. The costs are running two systems and the occasional loss shown in query 48.
+  In production, hybrid retrieval followed by a cross-encoder re-ranker over the top
+  ~100 is the standard strong pipeline, and Recall@100 = 0.955 is what that re-ranker
+  would get to work with.
+
+### Complexity
+
+- Dense indexing: one encoder forward pass per document (O(N · seq² · layers)), 80.6 s
+  on CPU here. Storage N × 384 floats = 7.6 MB.
+- Dense query: one forward pass (~12.4 ms, dominating everything) + O(N · d) dot
+  products + O(N) argpartition. Exact search is linear in N; at millions of documents
+  you'd use an approximate index (HNSW or IVF-PQ).
+- RRF: O(total length of the fused lists) per query, here 81 µs in Python.
+
+### Likely interview questions
+
+1. **Why did a neural model lose to BM25 here?** MiniLM is a general-purpose model
+   trained on web and QA pairs, not on biomedical claims. SciFact rewards exact matches on
+   rare technical terms (vCJD, gene names), which is where IDF shines, and the BEIR
+   benchmark showed many dense models struggle out of domain. Fine-tuning on in-domain
+   data or using a larger or biomedical encoder would change the picture.
+2. **Why RRF instead of adding normalised scores?** BM25 scores (0–30, unbounded) and
+   cosine similarities (around 0.2–0.7) are on unrelated scales that vary per query.
+   Rank-based fusion avoids calibration entirely. The constant 60 damps the influence
+   of top ranks, so agreement between systems matters more than one system's strong
+   opinion. Query 48 shows the downside of that.
+3. **How would you make dense retrieval fast enough for production?** Batch and quantise
+   the query encoder or run it on a GPU, use a smaller or distilled model, cache frequent
+   queries, and replace exact search with HNSW. Or keep BM25 as a cheap first stage and
+   use the neural model only to re-rank its top 100.
