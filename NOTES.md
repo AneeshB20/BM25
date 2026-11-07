@@ -215,3 +215,101 @@ Debug build (`build-debug/`): also 0 warnings, 6/6 tests pass.
 3. **What makes `get_data.sh` safe to run twice?** It checks for every required file
    before downloading, and it extracts into a temp dir that is moved into place in one
    step at the end. A failed run cleans up through `trap`.
+
+---
+
+## Phase 2: Tokenizer and Porter stemmer
+
+### What was built
+
+- `Tokenizer` (`include/bm25/tokenizer.hpp`): lowercase ASCII → split on anything
+  that is not `[a-z0-9]` → drop empties → optional stopword removal → optional
+  Porter stemming. The two options are fields of `TokenizerOptions`, so the
+  Phase 5 ablations only change a flag.
+- `PorterStemmer` (`include/bm25/porter_stemmer.hpp`): a hand-written C++
+  translation of Martin Porter's reference C implementation, steps 1a, 1b, 1c, 2, 3,
+  4, 5a, 5b. No library.
+- Tests were written first and committed against stub implementations (commit
+  `test: add tokenizer and Porter stemmer tests…`). 18 of them failed against the
+  stubs. Then the implementation was written until they all passed.
+
+### Evidence
+
+```
+$ ctest --test-dir build --output-on-failure
+...
+28/28 Test #28: PorterStemmer.OfficialVocabulary ...........   Passed    0.01 sec
+100% tests passed out of 28
+```
+
+- 12 tokenizer tests: punctuation, digits/decimals, mixed case, empty string, only
+  separators, non-ASCII bytes, only stopwords, stopwords among other words, the
+  stemming flag, stopword-before-stem ordering, defaults, and the exact 33-word list.
+- 60 hand-picked word → stem pairs (6 from the 1980 paper, 54 from the official
+  vocabulary, grouped by step), plus short-word cases.
+- `PorterStemmer.OfficialVocabulary` runs **all 23,531 words** of the official
+  `voc.txt` against `output.txt` with **0 mismatches**. `get_data.sh` downloads the
+  files into `data/porter/`; the test skips if they're missing.
+- The same suite also passed under AddressSanitizer + UndefinedBehaviorSanitizer
+  (`build-asan/`, `-fsanitize=address,undefined -D_GLIBCXX_ASSERTIONS`). This
+  matters because the stemmer does a lot of index arithmetic.
+
+### Which stopword list
+
+Lucene's `EnglishAnalyzer.ENGLISH_STOP_WORDS_SET`, which is Anserini's default. It
+has exactly 33 words:
+`a an and are as at be but by for if in into is it no not of on or such that the
+their then there these they this to was will with`.
+It is deliberately short. Words like "we", "were", "has" and "can" are **not** in it.
+
+### Design choices
+
+- **Stopwords are checked before stemming**, as in Lucene's analyzer chain
+  (StopFilter → PorterStemFilter). The stem of a stopword can be a normal word
+  ("this" → "thi"), so checking after stemming would let stopwords through.
+- **ASCII-only character tests** instead of `std::isalnum`/`std::tolower`. Those depend
+  on the locale and are undefined behaviour for bytes ≥ 0x80 when `char` is signed,
+  which UTF-8 text is full of. The cost is that non-ASCII letters (β, ï, µ) act as
+  separators: "β-cell" becomes "cell". That is a known recall loss on SciFact.
+- **Which Porter version.** Martin Porter's reference implementation differs from the
+  1980 paper in a few places (`-bli → -ble`, the added `-logi → -log` rule, and never
+  stemming words of length ≤ 2). Lucene uses the reference version, and so does the
+  official test vocabulary. Matching it is what makes the 23,531-word test possible.
+- **Binary search over a sorted `std::array`** for stopwords. With 33 entries this is
+  at most 6 comparisons and needs no heap allocation. A hash set would also be fine.
+
+### Why stemming helps recall, and what it breaks
+
+- **Helps:** a query about "infections" should match a document that says "infected"
+  or "infection". Stemming maps all three to "infect", so they share one posting list.
+  More relevant documents become reachable, which raises recall. It also merges the
+  statistics, so the document frequency (and so the IDF) reflects the concept rather
+  than one surface form.
+- **Breaks (over-stemming):** unrelated words collapse together. "university" and
+  "universal" both become "univers", and "generous" and "generalization" both become
+  "gener". The query term "general" then also matches documents about "generous"
+  behaviour. Each merge like this lowers precision a little.
+- **Misses (under-stemming):** irregular forms are not merged ("mice"/"mouse",
+  "ran"/"run"), and neither are British/American spellings.
+- Stems are not words ("poni", "happi"), so they should never be shown to a user.
+
+### Complexity
+
+- `tokenize`: O(n) in the text length. Every character is visited once; the stemmer
+  works on a token of length L in O(L) per step (each step tests a constant number of
+  suffixes), and `m()` is O(L).
+- Space: O(n) for the output tokens.
+
+### Likely interview questions
+
+1. **Why must documents and queries use the same tokenizer?** Matching is exact string
+   equality on terms. If documents are stemmed and queries are not, "infections" never
+   finds the term "infect".
+2. **What is the Porter "measure" m?** Write any word as `[C](VC)^m[V]`. m counts the
+   vowel-consonant pairs, a rough proxy for syllables. Rules like "remove -ment if
+   m > 1" stop the algorithm from stripping short words down to nothing ("cement"
+   keeps its ending, "replacement" loses it).
+3. **Why not lemmatize instead of stemming?** Lemmatization needs a dictionary and
+   part-of-speech tags, which is slower and language-specific. For ranking, all we
+   need is that related forms collide, and they don't need to be real words. Porter is
+   fast, deterministic and is what the Anserini baseline we compare against uses.
