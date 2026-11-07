@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <queue>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace bm25 {
@@ -41,8 +40,13 @@ std::vector<SearchResult> Searcher::search(std::string_view query, std::size_t k
     }
 
     // 2. Term-at-a-time scoring: walk each posting list and add the term's
-    //    contribution into a per-document accumulator.
-    std::unordered_map<std::uint32_t, double> acc;
+    //    contribution into a dense per-document accumulator (one double per
+    //    document, indexed by doc id), remembering which documents were
+    //    touched so step 3 only visits those. Every matching document gets a
+    //    strictly positive score (idf > 0, tf >= 1), so "== 0.0" means "not
+    //    touched yet".
+    std::vector<double> acc(index_.num_docs(), 0.0);
+    std::vector<std::uint32_t> touched;
     for (const std::string& term : terms) {
         const std::vector<Posting>& plist = index_.postings(term);
         if (plist.empty()) {
@@ -50,7 +54,11 @@ std::vector<SearchResult> Searcher::search(std::string_view query, std::size_t k
         }
         const double idf = scorer_.idf(static_cast<std::uint32_t>(plist.size()));
         for (const Posting& p : plist) {
-            acc[p.doc_id] += scorer_.term_score(idf, p.tf, index_.doc_length(p.doc_id));
+            double& slot = acc[p.doc_id];
+            if (slot == 0.0) {
+                touched.push_back(p.doc_id);
+            }
+            slot += scorer_.term_score(idf, p.tf, index_.doc_length(p.doc_id));
         }
     }
 
@@ -60,8 +68,8 @@ std::vector<SearchResult> Searcher::search(std::string_view query, std::size_t k
     //    O(M log k) for M matching documents, instead of O(M log M) for a sort.
     std::priority_queue<SearchResult, std::vector<SearchResult>, RanksHigher> heap;
     const RanksHigher ranks_higher;
-    for (const auto& [doc_id, score] : acc) {
-        const SearchResult cand{doc_id, score};
+    for (const std::uint32_t doc_id : touched) {
+        const SearchResult cand{doc_id, acc[doc_id]};
         if (heap.size() < k) {
             heap.push(cand);
         } else if (ranks_higher(cand, heap.top())) {
