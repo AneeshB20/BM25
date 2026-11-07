@@ -9,11 +9,16 @@
 //       Runs the tokenizer ablations and the k1 x b grid and writes a Markdown table.
 //       With --runs-dir, also writes each configuration's run file there.
 //
-//   bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR]
+//   bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR] [--index FILE]
 //       Spins for S seconds (default 15) building and querying, untimed, so a
 //       laptop CPU leaves its low-power clock state; then times the index build
 //       and every judged query N times (default 5), discards the first
 //       repetition, and prints build time and per-query latency percentiles.
+//       With --index FILE, also times loading that saved index and checks the
+//       loaded index returns the same results as the freshly built one.
+//
+//   --index FILE (evaluation mode): load a saved index (and its tokenizer
+//   options) instead of building one from the corpus.
 
 #include <algorithm>
 #include <chrono>
@@ -179,7 +184,8 @@ double percentile(const std::vector<double>& sorted, double p) {
 }
 
 int run_bench(const bm25::Corpus& corpus, const bm25::TokenizerOptions& opts,
-              const bm25::Bm25Params& params, std::size_t depth, int repeats, double warmup_sec) {
+              const bm25::Bm25Params& params, std::size_t depth, int repeats, double warmup_sec,
+              const std::string& index_path) {
     if (repeats < 2) throw std::runtime_error("--repeats must be at least 2");
     const bm25::Tokenizer tokenizer(opts);
     const std::vector<bm25::Query> queries = corpus.judged_queries();
@@ -207,6 +213,32 @@ int run_bench(const bm25::Corpus& corpus, const bm25::TokenizerOptions& opts,
     }
     std::sort(build_ms.begin(), build_ms.end());
 
+    // Optional: time loading a saved index the same way.
+    std::vector<double> load_ms;
+    if (!index_path.empty()) {
+        for (int r = 0; r < repeats; ++r) {
+            const auto t0 = Clock::now();
+            const bm25::InvertedIndex loaded = bm25::InvertedIndex::load(index_path);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if (r > 0) load_ms.push_back(ms);
+            if (r == 0) {
+                // Correctness: the loaded index must rank exactly like the built one.
+                const bm25::Searcher a(index, tokenizer, params);
+                const bm25::Searcher b(loaded, tokenizer, params);
+                for (const bm25::Query& q : queries) {
+                    const auto ra = a.search(q.text, depth);
+                    const auto rb = b.search(q.text, depth);
+                    bool same = ra.size() == rb.size();
+                    for (std::size_t i = 0; same && i < ra.size(); ++i) {
+                        same = ra[i].doc_id == rb[i].doc_id && ra[i].score == rb[i].score;
+                    }
+                    if (!same) throw std::runtime_error("loaded index disagrees on query " + q.id);
+                }
+            }
+        }
+        std::sort(load_ms.begin(), load_ms.end());
+    }
+
     // Query latency: every judged query, `repeats` passes, first pass discarded.
     const bm25::Searcher searcher(index, tokenizer, params);
     std::vector<double> lat_us;
@@ -228,6 +260,10 @@ int run_bench(const bm25::Corpus& corpus, const bm25::TokenizerOptions& opts,
                 warmup_sec, repeats, depth, queries.size());
     std::printf("index build:  median %.1f ms  (min %.1f, max %.1f) over %zu runs\n",
                 percentile(build_ms, 50), build_ms.front(), build_ms.back(), build_ms.size());
+    if (!load_ms.empty()) {
+        std::printf("index load:   median %.1f ms  (min %.1f, max %.1f) over %zu runs; results identical to build\n",
+                    percentile(load_ms, 50), load_ms.front(), load_ms.back(), load_ms.size());
+    }
     std::printf("query p50:    %.1f us\n", percentile(lat_us, 50));
     std::printf("query p95:    %.1f us\n", percentile(lat_us, 95));
     std::printf("query p99:    %.1f us\n", percentile(lat_us, 99));
@@ -243,7 +279,7 @@ void usage() {
                  "usage: bm25_eval [--data DIR] [--out RUN] [--metrics-out TSV] [-k N]\n"
                  "                 [--k1 X] [--b X] [--no-stem] [--no-stopwords] [--tag NAME]\n"
                  "       bm25_eval --ablations MD [--data DIR] [--runs-dir DIR]\n"
-                 "       bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR]\n");
+                 "       bm25_eval --bench [--repeats N] [--warmup-sec S] [-k N] [--data DIR] [--index FILE]\n");
 }
 
 }  // namespace
@@ -255,6 +291,7 @@ int main(int argc, char** argv) {
     std::string ablations_path;
     std::string runs_dir;
     std::string tag = "bm25";
+    std::string index_path;
     std::size_t depth = 100;
     bool depth_given = false;
     bool bench = false;
@@ -275,6 +312,8 @@ int main(int argc, char** argv) {
             ablations_path = argv[++i];
         } else if (std::strcmp(argv[i], "--runs-dir") == 0 && has_value) {
             runs_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--index") == 0 && has_value) {
+            index_path = argv[++i];
         } else if (std::strcmp(argv[i], "--tag") == 0 && has_value) {
             tag = argv[++i];
         } else if (std::strcmp(argv[i], "-k") == 0 && has_value) {
@@ -307,12 +346,18 @@ int main(int argc, char** argv) {
         }
         if (bench) {
             // Benchmark top-10 retrieval unless a depth was asked for.
-            return run_bench(corpus, opts, params, depth_given ? depth : 10, repeats, warmup_sec);
+            return run_bench(corpus, opts, params, depth_given ? depth : 10, repeats, warmup_sec, index_path);
         }
 
-        const bm25::Tokenizer tokenizer(opts);
         bm25::InvertedIndex index;
-        index.build(corpus.documents(), tokenizer);
+        if (!index_path.empty()) {
+            index = bm25::InvertedIndex::load(index_path);
+            opts = index.tokenizer_options();  // queries must match the saved index
+        }
+        const bm25::Tokenizer tokenizer(opts);
+        if (index_path.empty()) {
+            index.build(corpus.documents(), tokenizer);
+        }
 
         File run = open_for_write(run_path);
         File metrics = open_for_write(metrics_path);

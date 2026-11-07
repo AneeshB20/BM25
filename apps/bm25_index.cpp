@@ -1,6 +1,9 @@
 // Builds the inverted index over a BEIR dataset and prints build statistics.
 //
 // Usage: bm25_index [--data DIR] [--no-stem] [--no-stopwords] [--export-tokens DIR]
+//                   [--save FILE]
+//
+// --save FILE writes the index in binary form (see InvertedIndex::save).
 //
 // --export-tokens DIR writes the tokenizer output so scripts/reference_bm25.py
 // can score exactly the same terms:
@@ -11,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -24,7 +28,8 @@ namespace {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: bm25_index [--data DIR] [--no-stem] [--no-stopwords] [--export-tokens DIR]\n");
+                 "usage: bm25_index [--data DIR] [--no-stem] [--no-stopwords] [--export-tokens DIR]\n"
+                 "                  [--save FILE]\n");
 }
 
 void write_tokens_line(std::ofstream& out, const std::string& id,
@@ -57,6 +62,7 @@ void export_tokens(const bm25::Corpus& corpus, const bm25::Tokenizer& tokenizer,
 int main(int argc, char** argv) {
     std::string data_dir = "data/scifact";
     std::string export_dir;
+    std::string save_path;
     bm25::TokenizerOptions opts;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
@@ -67,6 +73,8 @@ int main(int argc, char** argv) {
             opts.remove_stopwords = false;
         } else if (std::strcmp(argv[i], "--export-tokens") == 0 && i + 1 < argc) {
             export_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
+            save_path = argv[++i];
         } else {
             usage();
             return 2;
@@ -101,6 +109,13 @@ int main(int argc, char** argv) {
         std::printf("avgdl (tokens):   %.4f\n", index.avgdl());
         std::printf("memory (approx):  %.2f MB\n", s.memory_mb);
 
+        if (!save_path.empty()) {
+            const auto t_save = Clock::now();
+            index.save(save_path);
+            const double save_ms = ms_since(t_save);
+            const double mb = static_cast<double>(std::filesystem::file_size(save_path)) / (1024.0 * 1024.0);
+            std::printf("saved index:      %s (%.2f MB, %.1f ms)\n", save_path.c_str(), mb, save_ms);
+        }
         if (!export_dir.empty()) {
             export_tokens(corpus, tokenizer, export_dir);
             std::printf("tokens exported:  %s/{corpus,query}_tokens.tsv\n", export_dir.c_str());
