@@ -702,3 +702,137 @@ reorders those 100. Ours is 0.93: a re-ranker would get to see 93% of what it ne
    pytrec_eval) to within 5e-7 on every one of the 300 queries, and the unit tests check
    hand-derived cases: a perfect ranking, the cutoff, graded gain, an ideal DCG that
    includes unretrieved relevant documents, and no relevant documents at all.
+
+---
+
+## Phase 6: Performance
+
+Full tables: `results/perf.md`. Summary: query p50 **159.9 → 27.7 µs** (5.8×), p99
+257.3 → 62.5 µs, index build 176.7 → 149.8 ms. Loading a saved index takes **5.7 ms**,
+against 152.5 ms to rebuild. Every step left results byte-identical.
+
+### Method
+
+1. **Benchmark first** (`bm25_eval --bench`, wrapped by `scripts/bench.sh`): 5 index
+   builds and 5 passes over the 300 queries, discarding the first of each; nearest-rank
+   p50/p95/p99 over 1,200 query timings; 3 trials pinned to one core; the median trial
+   is reported.
+2. **A trap found on the way:** the laptop is in `power-saver` mode, and the same binary
+   measured either ~160 µs or ~520 µs p50 depending on whether the CPU had ramped up its
+   clock. A 3 s warm-up wasn't enough; a 15 s untimed warm-up made runs consistent. Without
+   this, a "3× speedup" could have been nothing but clock speed. Lesson: check that
+   repeated runs of an *unchanged* binary agree before trusting any before/after number.
+3. **Profile.** `perf` is blocked here (`perf_event_paranoid = 4`, no root), so a
+   `-pg` build was profiled with gprof (30 builds + 9,000 queries). The relevant lines
+   of the flat profile:
+   - query path: `Bm25Scorer::term_score` 40.2M calls (8.6% of samples),
+     `unordered_map<uint32_t,double>::operator[]` 40.2M calls (6.6%) plus its rehash
+     (1.5%). That's about 4,470 postings scored per query, and each one paid for a hash
+     lookup, sometimes a node allocation, and a division.
+   - build path: `Tokenizer::tokenize` (18%), `PorterStemmer::stem` and its steps (~20%),
+     string-keyed hash-map lookups (13.5% + 5.4% + 1.7%).
+   - query-time string hashing of query terms: about 10 per query, which doesn't register.
+     So interning terms "so posting lookups do not hash strings at query time" was **not**
+     justified for queries. It was justified for the build.
+4. **Optimise one thing at a time.** After each change: unit tests, `scripts/verify.sh`
+   (Python cross-check 50/50 plus a byte-for-byte run file comparison), then
+   `scripts/bench.sh 3`, then a separate commit.
+
+### The three optimisations
+
+**1. Dense accumulator** (`src/searcher.cpp`). Before, scores lived in
+`unordered_map<doc_id, double>`. Every posting meant hashing, probing a bucket, often
+allocating a node, and occasionally rehashing the whole table. Now there is a
+`vector<double>(N)` indexed by doc id, plus a `touched` list of the documents that got a
+score (a score of exactly 0.0 means untouched, because every real contribution is
+strictly positive). The top-k heap then scans only `touched`. Result: p50 159.9 → 32.3 µs
+(**4.9×**), the biggest win by far. Costs: O(N) memory per query (41 KB for SciFact) and
+an O(N) zero-fill, which is negligible next to ~4,470 scattered hash operations. For a
+corpus of 100M documents you would keep one buffer per thread and reset only the touched
+entries.
+
+*Why double rather than the "float accumulator" in the prompt:* a float has about 7
+significant digits, and scores here reach ~10–40, so float error is ~1e-6. That would put
+the 1e-6 Python cross-check at risk and could reorder near-ties. The 41 KB saved isn't
+worth it at this scale.
+
+**2. Precomputed length normalisation** (`Bm25Scorer::length_norm`,
+`Searcher::length_norms_`). `k1 * (1 - b + b * dl / avgdl)` depends only on the document,
+not the query. The Searcher constructor now computes it once per document (O(N)), and the
+per-posting work drops to one add and one divide: `idf * tf * (k1+1) / (tf + norm[d])`.
+It also removes the `doc_lengths` lookup from the inner loop. Result: p50 32.3 → 27.5 µs
+(−15%). It's bit-identical because the same operations run in the same order; the test
+`PrecomputedNormGivesIdenticalScore` checks it with `EXPECT_EQ` on doubles. A tempting
+further step, folding `idf * (k1+1)` into one constant, would change the rounding order,
+and was rejected for that reason.
+
+**3. Term interning** (`InvertedIndex`). The dictionary is now `term → uint32 id` and
+the posting lists are `vector<vector<Posting>>` indexed by id. Before, every token went
+through a per-document `unordered_map<string, uint32>` (allocating a node and copying the
+string for each new term in each document), and then each unique term was hashed *again*
+into the postings map. Now each token is hashed once, to get its id; per-document tf
+counting uses a plain `vector<uint32>` indexed by id plus a list of the ids seen in that
+document. Result: build 168.6 → 149.8 ms (−11%); query time unchanged, as the profile
+predicted. This departs from the `unordered_map<string, vector<Posting>>` layout in
+CLAUDE.md, which Phase 0 flagged as likely to change in this phase. Its estimated memory
+rose from 7.83 to 8.18 MB, because the 26,156 vector headers now sit in a growable vector
+with spare capacity.
+
+**Not done, and why.** "Reserve vector capacity during indexing" wasn't justified:
+posting-list `realloc_insert` was 0.5% of the profile. What remains in the build is
+tokenizing and stemming (one `std::string` allocation per token, for 850k tokens). That
+would be the next target: tokenize into a reused buffer and stem in place.
+
+### Index save / load
+
+`InvertedIndex::save/load` write a simple binary format (native little-endian):
+
+```
+"BM25IDX\0" | u32 version=1 | u8 stem | u8 stopwords | u64 N | f64 avgdl
+N × (u32 len, bytes)            external doc ids
+N × u32                          doc lengths
+u64 V, then V × (u32 len, term bytes, u64 count, count × {u32 doc_id, u32 tf})
+```
+
+- **The tokenizer options are stored in the file**, so `bm25_eval --index` queries with
+  the same analysis the index was built with. A mismatch would silently return garbage.
+- **Posting arrays are written and read as raw bytes** in one call each, so loading is
+  mostly `memcpy` plus re-inserting 26,156 terms into the hash map.
+- **Defensive loading:** the magic number, version, a document-count bound, a posting
+  count ≤ N, no duplicate terms, no truncation and no trailing bytes are all checked, and
+  each failure throws. Five tests cover the round trip, an empty index, a missing file,
+  wrong magic, and truncation.
+- Numbers: file 4.45 MiB (the corpus JSONL is 7.73 MiB); load 5.7 ms against 152.5 ms
+  to rebuild, about 27× faster, before even counting the ~169 ms of JSON parsing a
+  rebuild also needs. The loaded index gives identical results on all 300 queries.
+- Limitation: not portable across endianness or `sizeof` changes. A production format
+  would fix the byte order, add a checksum, and probably delta-encode postings.
+
+### Complexity after Phase 6
+
+- Build: O(T·L) expected, as before, but now one string hash per token instead of about
+  1.6 (850,090 token lookups instead of 850,090 + 512,968).
+- Searcher construction: O(N) to precompute the norms. Construct one per index and
+  parameter set, not one per query.
+- Query: O(N) zero-fill + O(Σp_i) scoring with a smaller constant + O(M log k) top-k.
+  For SciFact the O(N) part is a 41 KB memset; at web scale you'd reset only the touched
+  slots.
+- Load: O(file size) + O(V) hash inserts.
+
+### Likely interview questions
+
+1. **What was your biggest speedup and why did it work?** Replacing the hash-map
+   accumulator with a dense array: 4.9× at p50. Each of the ~4,470 postings per query
+   used to pay for hashing, bucket probing, frequent node allocation and occasional
+   rehashing. An array index is one address computation on contiguous memory. The
+   profile pointed straight at it: 40M `operator[]` calls.
+2. **How did you make sure optimisations didn't change results?** A regression gate run
+   after every change: the run file for all 300 queries (top-100, 9-decimal scores) had
+   to stay byte-identical, and the Python reference had to still match. I also avoided
+   any change that would reorder floating-point operations, which is why `idf*(k1+1)` is
+   not folded.
+3. **Your first benchmark said 520 µs and later 160 µs for the same code. Why?** CPU
+   frequency scaling in power-saver mode. I found it by re-running an unchanged binary
+   and getting different numbers, then fixed it with a 15 s warm-up and core pinning, and
+   by reporting the median of three trials. Benchmarks are only worth trusting once
+   repeated runs of the same code agree.
