@@ -20,7 +20,12 @@ struct RanksHigher {
 }  // namespace
 
 Searcher::Searcher(const InvertedIndex& index, const Tokenizer& tokenizer, Bm25Params params)
-    : index_(index), tokenizer_(tokenizer), scorer_(index.num_docs(), index.avgdl(), params) {}
+    : index_(index), tokenizer_(tokenizer), scorer_(index.num_docs(), index.avgdl(), params) {
+    length_norms_.reserve(index_.num_docs());
+    for (std::uint32_t d = 0; d < index_.num_docs(); ++d) {
+        length_norms_.push_back(scorer_.length_norm(index_.doc_length(d)));
+    }
+}
 
 std::vector<SearchResult> Searcher::search(std::string_view query, std::size_t k) const {
     if (k == 0) {
@@ -58,7 +63,7 @@ std::vector<SearchResult> Searcher::search(std::string_view query, std::size_t k
             if (slot == 0.0) {
                 touched.push_back(p.doc_id);
             }
-            slot += scorer_.term_score(idf, p.tf, index_.doc_length(p.doc_id));
+            slot += scorer_.term_score_normed(idf, p.tf, length_norms_[p.doc_id]);
         }
     }
 

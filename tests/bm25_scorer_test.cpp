@@ -1,6 +1,7 @@
 #include "bm25/bm25_scorer.hpp"
 
 #include <cmath>
+#include <cstdint>
 
 #include <gtest/gtest.h>
 
@@ -68,4 +69,16 @@ TEST(Bm25Scorer, KeepsParams) {
     const Bm25Scorer s(10, 5.0, Bm25Params{1.2, 0.75});
     EXPECT_DOUBLE_EQ(s.params().k1, 1.2);
     EXPECT_DOUBLE_EQ(s.params().b, 0.75);
+}
+
+TEST(Bm25Scorer, PrecomputedNormGivesIdenticalScore) {
+    // The Searcher's fast path must produce bit-identical doubles.
+    const Bm25Scorer s(5183, 164.015, Bm25Params{0.9, 0.4});
+    for (std::uint32_t dl : {0u, 1u, 7u, 164u, 999u}) {
+        for (std::uint32_t tf : {1u, 2u, 13u}) {
+            EXPECT_EQ(s.term_score_normed(1.2345, tf, s.length_norm(dl)), s.term_score(1.2345, tf, dl));
+        }
+    }
+    // An empty document: k1 * (1 - b + b * 0 / avgdl) = k1 * (1 - b).
+    EXPECT_DOUBLE_EQ(Bm25Scorer(4, 3.5).length_norm(0), 0.9 * 0.6);
 }

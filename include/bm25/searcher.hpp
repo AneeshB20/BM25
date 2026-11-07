@@ -35,6 +35,9 @@ private:
     const InvertedIndex& index_;
     const Tokenizer& tokenizer_;
     Bm25Scorer scorer_;
+    // scorer_.length_norm(doc_length(d)) for every document d, computed once in
+    // the constructor so the scoring loop does no per-posting division.
+    std::vector<double> length_norms_;
 };
 
 }  // namespace bm25
