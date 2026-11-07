@@ -199,3 +199,38 @@ TEST(InvertedIndexPersistence, TruncatedFileThrows) {
     std::ofstream(cut, std::ios::binary) << bytes.substr(0, bytes.size() - 5);
     EXPECT_THROW(InvertedIndex::load(cut), std::runtime_error);
 }
+
+namespace {
+
+// Saves a one-document index ("x": "cat") and returns the file's bytes. The
+// file ends with the single posting of "cat": u32 doc_id, u32 tf.
+std::string one_posting_file(const std::string& path) {
+    InvertedIndex idx;
+    idx.build({{"x", "cat"}}, Tokenizer(TokenizerOptions{false, false}));
+    idx.save(path);
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void write_u32_at(std::string& bytes, std::size_t offset, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) bytes[offset + i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+}
+
+}  // namespace
+
+TEST(InvertedIndexPersistence, OutOfRangeDocIdThrows) {
+    const std::string path = temp_path("bad_docid.bin");
+    std::string bytes = one_posting_file(path);
+    ASSERT_NO_THROW(InvertedIndex::load(path));
+    write_u32_at(bytes, bytes.size() - 8, 4000000000u);  // doc_id
+    std::ofstream(path, std::ios::binary) << bytes;
+    EXPECT_THROW(InvertedIndex::load(path), std::runtime_error);
+}
+
+TEST(InvertedIndexPersistence, ZeroTfThrows) {
+    const std::string path = temp_path("bad_tf.bin");
+    std::string bytes = one_posting_file(path);
+    write_u32_at(bytes, bytes.size() - 4, 0);  // tf
+    std::ofstream(path, std::ios::binary) << bytes;
+    EXPECT_THROW(InvertedIndex::load(path), std::runtime_error);
+}

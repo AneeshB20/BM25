@@ -1,5 +1,6 @@
 #include "bm25/searcher.hpp"
 
+#include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -163,4 +164,15 @@ TEST(Searcher, StemmedQueryMatchesStemmedDocs) {
     const auto r = Searcher(idx, tok).search("infected", 10);
     ASSERT_EQ(r.size(), 1u);
     EXPECT_EQ(idx.external_id(r[0].doc_id), "a");
+}
+
+TEST(Searcher, RejectsInvalidParams) {
+    const Tokenizer tok;
+    InvertedIndex idx;
+    idx.build({{"a", "cat"}}, tok);
+    EXPECT_THROW(Searcher(idx, tok, bm25::Bm25Params{-1.0, 0.4}), std::invalid_argument);
+    EXPECT_THROW(Searcher(idx, tok, bm25::Bm25Params{0.9, 2.0}), std::invalid_argument);
+    EXPECT_THROW(Searcher(idx, tok, bm25::Bm25Params{0.9, -0.1}), std::invalid_argument);
+    EXPECT_NO_THROW(Searcher(idx, tok, bm25::Bm25Params{0.0, 0.0}));
+    EXPECT_NO_THROW(Searcher(idx, tok, bm25::Bm25Params{2.0, 1.0}));
 }

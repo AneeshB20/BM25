@@ -11,7 +11,6 @@ FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
 add_executable(bm25_tests
-  placeholder_test.cpp
   corpus_test.cpp
   tokenizer_test.cpp
   porter_stemmer_test.cpp
